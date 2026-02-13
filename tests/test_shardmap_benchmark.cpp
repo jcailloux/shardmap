@@ -181,7 +181,7 @@ static void doNotOptimize(const T& val) {
 }
 
 // =============================================================================
-// Metadata type matching smartrepo's EntityCacheMetadata
+// Metadata type matching relais's EntityCacheMetadata
 // =============================================================================
 
 struct BenchMetadata {
