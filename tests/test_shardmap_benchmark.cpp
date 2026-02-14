@@ -450,65 +450,341 @@ TEST_CASE("Benchmark: random-key get by shard count (large map)", "[benchmark][g
 
 // #############################################################################
 //
-//  7. Multi-threaded read throughput — small vs large maps
+//  7. Multi-threaded throughput
+//     Aligned with relais benchmark conditions for overhead comparison.
 //
 // #############################################################################
 
-TEST_CASE("Benchmark: multi-threaded read throughput", "[benchmark][throughput]")
+// =============================================================================
+// Throughput helpers
+// =============================================================================
+
+static std::string fmtDuration(double us) {
+    std::ostringstream out;
+    out << std::fixed;
+    if (us < 1.0)            out << std::setprecision(0) << us * 1000 << " ns";
+    else if (us < 1'000)     out << std::setprecision(1) << us << " us";
+    else if (us < 1'000'000) out << std::setprecision(2) << us / 1'000 << " ms";
+    else                     out << std::setprecision(2) << us / 1'000'000 << " s";
+    return out.str();
+}
+
+static std::string fmtOps(double ops) {
+    std::ostringstream out;
+    out << std::fixed;
+    if (ops >= 1'000'000)  out << std::setprecision(1) << ops / 1'000'000 << "M ops/s";
+    else if (ops >= 1'000) out << std::setprecision(1) << ops / 1'000 << "K ops/s";
+    else                   out << std::setprecision(0) << ops << " ops/s";
+    return out.str();
+}
+
+/// Run N threads x ops, synchronized with latches. Returns wall time (work only).
+/// Each thread is pinned to a separate CPU core for true parallelism.
+template<typename Fn>
+static auto measureParallel(int num_threads, int ops_per_thread, Fn&& fn) {
+    std::latch ready{num_threads};
+    std::latch go{1};
+    std::vector<std::jthread> threads;
+    threads.reserve(num_threads);
+
+    for (int i = 0; i < num_threads; ++i) {
+        threads.emplace_back([&, i]() {
+            cpu_set_t mask;
+            CPU_ZERO(&mask);
+            CPU_SET(i % std::thread::hardware_concurrency(), &mask);
+            sched_setaffinity(0, sizeof(mask), &mask);
+
+            ready.count_down();
+            go.wait();
+            fn(i, ops_per_thread);
+        });
+    }
+
+    ready.wait();
+    auto t0 = Clock::now();
+    go.count_down();
+    for (auto& t : threads) t.join();
+    return Clock::now() - t0;
+}
+
+struct DurationResult {
+    Clock::duration elapsed;
+    int64_t total_ops;
+};
+
+/// Duration-based benchmark duration (configurable via BENCH_DURATION_S env var).
+static int benchDurationSeconds() {
+    static int n = [] {
+        if (auto* env = std::getenv("BENCH_DURATION_S"))
+            if (int v = std::atoi(env); v > 0) return v;
+        return 10;
+    }();
+    return n;
+}
+
+/// Run N threads for a fixed duration. Each thread loops until `running` is set to false.
+/// fn(int tid, std::atomic<bool>& running) must return the number of ops performed.
+template<typename Fn>
+static DurationResult measureDuration(int num_threads, Fn&& fn) {
+    std::latch ready{num_threads};
+    std::latch go{1};
+    std::atomic<bool> running{true};
+    std::vector<std::atomic<int64_t>> ops_counts(num_threads);
+    std::vector<std::jthread> threads;
+    threads.reserve(num_threads);
+
+    for (int i = 0; i < num_threads; ++i) {
+        ops_counts[i].store(0);
+        threads.emplace_back([&, i]() {
+            cpu_set_t mask;
+            CPU_ZERO(&mask);
+            CPU_SET(i % std::thread::hardware_concurrency(), &mask);
+            sched_setaffinity(0, sizeof(mask), &mask);
+
+            ready.count_down();
+            go.wait();
+            ops_counts[i].store(fn(i, running), std::memory_order_relaxed);
+        });
+    }
+
+    ready.wait();
+    auto t0 = Clock::now();
+    go.count_down();
+    std::this_thread::sleep_for(std::chrono::seconds(benchDurationSeconds()));
+    running.store(false, std::memory_order_relaxed);
+    for (auto& t : threads) t.join();
+    auto elapsed = Clock::now() - t0;
+
+    int64_t total = 0;
+    for (auto& c : ops_counts) total += c.load(std::memory_order_relaxed);
+    return {elapsed, total};
+}
+
+/// Format a multi-threaded throughput measurement (fixed ops).
+static std::string formatThroughput(
+        const std::string& label, int threads, int ops_per_thread,
+        Clock::duration elapsed) {
+    auto us = std::chrono::duration_cast<std::chrono::microseconds>(elapsed).count();
+    auto total_ops = static_cast<int64_t>(threads) * ops_per_thread;
+    auto ops_per_sec = (us > 0) ? total_ops * 1'000'000.0 / us : 0.0;
+    auto avg_us = (total_ops > 0) ? static_cast<double>(us) / total_ops : 0.0;
+
+    auto bar = std::string(50, '-');
+    std::ostringstream out;
+    out << "\n"
+        << "  " << bar << "\n"
+        << "  " << label << "\n"
+        << "  " << bar << "\n"
+        << "  threads:      " << threads << "\n"
+        << "  ops/thread:   " << ops_per_thread << "\n"
+        << "  total ops:    " << total_ops << "\n"
+        << "  wall time:    " << fmtDuration(static_cast<double>(us)) << "\n"
+        << "  throughput:   " << fmtOps(ops_per_sec) << "\n"
+        << "  avg latency:  " << fmtDuration(avg_us) << "\n"
+        << "  " << bar;
+    return out.str();
+}
+
+/// Format a duration-based throughput measurement.
+static std::string formatDurationThroughput(
+        const std::string& label, int threads,
+        const DurationResult& result) {
+    auto us = std::chrono::duration_cast<std::chrono::microseconds>(result.elapsed).count();
+    auto ops_per_sec = (us > 0) ? result.total_ops * 1'000'000.0 / us : 0.0;
+    auto avg_us = (result.total_ops > 0) ? static_cast<double>(us) / result.total_ops : 0.0;
+
+    auto bar = std::string(50, '-');
+    std::ostringstream out;
+    out << "\n"
+        << "  " << bar << "\n"
+        << "  " << label << "\n"
+        << "  " << bar << "\n"
+        << "  threads:      " << threads << "\n"
+        << "  duration:     " << std::fixed << std::setprecision(2)
+                              << static_cast<double>(us) / 1'000'000 << " s\n"
+        << "  total ops:    " << result.total_ops << "\n"
+        << "  throughput:   " << fmtOps(ops_per_sec) << "\n"
+        << "  avg latency:  " << fmtDuration(avg_us) << "\n"
+        << "  " << bar;
+    return out.str();
+}
+
+// =============================================================================
+// 7a. Fixed-ops throughput (comparable with relais benchmark)
+// =============================================================================
+
+TEST_CASE("Benchmark: multi-threaded throughput (fixed ops)", "[benchmark][throughput]")
 {
-    static constexpr int THREADS = 8;
-    static constexpr int OPS = 50'000;
+    static constexpr int THREADS = 6;
+    static constexpr int OPS = 2'000'000;
+    static constexpr int RUNS = 3;
+    static constexpr int NUM_KEYS = 64;
+    static constexpr auto cfg = ShardMapConfig{.shard_count_log2 = 3};
 
-    auto bench_mt = [&]<ShardMapConfig Cfg>(const std::string& label, int map_size) {
-        using Map = ShardMap<int64_t, std::shared_ptr<int>, BenchMetadata, Cfg>;
-        Map map;
-        auto keys = populateAndCollectKeys(map, map_size);
+    using Map = ShardMap<int64_t, std::shared_ptr<int>, BenchMetadata, cfg>;
+    Map map;
 
-        std::latch start{THREADS};
-        std::vector<std::jthread> threads;
-        threads.reserve(THREADS);
+    // Populate with NUM_KEYS entries (same seed as relais benchmark)
+    std::mt19937_64 rng(12345);
+    std::vector<int64_t> ids;
+    ids.reserve(NUM_KEYS);
+    for (int i = 0; i < NUM_KEYS; ++i) {
+        auto key = static_cast<int64_t>(rng());
+        ids.push_back(key);
+        map.put(key, std::make_shared<int>(i), BenchMetadata{i * 1000});
+    }
 
-        auto t0 = Clock::now();
-        for (int i = 0; i < THREADS; ++i) {
-            threads.emplace_back([&, i]() {
-                std::mt19937 rng(i * 42 + 7);
-                start.arrive_and_wait();
-                for (int j = 0; j < OPS; ++j) {
-                    auto key = keys[rng() % keys.size()];
+    SECTION("get -- single key (contention)") {
+        auto key = ids[0];
+        Clock::duration best = Clock::duration::max();
+        for (int r = 0; r < RUNS; ++r) {
+            auto elapsed = measureParallel(THREADS, OPS, [&](int, int n) {
+                for (int j = 0; j < n; ++j) {
                     doNotOptimize(map.get(key));
                 }
             });
+            best = std::min(best, elapsed);
         }
-        for (auto& t : threads) t.join();
-        auto elapsed = Clock::now() - t0;
-
-        auto total_ops = THREADS * OPS;
-        auto us = std::chrono::duration_cast<std::chrono::microseconds>(elapsed).count();
-        auto ops_sec = (us > 0) ? total_ops * 1'000'000.0 / us : 0.0;
-        auto avg_ns = (total_ops > 0) ? static_cast<double>(us) * 1000.0 / total_ops : 0.0;
-
-        std::ostringstream out;
-        out << std::fixed;
-        if (ops_sec >= 1'000'000) out << std::setprecision(1) << ops_sec / 1'000'000 << "M ops/s";
-        else                       out << std::setprecision(1) << ops_sec / 1'000 << "K ops/s";
-        out << ", avg " << std::setprecision(0) << avg_ns << " ns/op";
-
-        WARN("  " << label << ": " << out.str());
-    };
-
-    SECTION("8 shards, varying map size") {
-        constexpr auto cfg = ShardMapConfig{.shard_count_log2 = 3};
-        bench_mt.operator()<cfg>("  1K entries", 1'000);
-        bench_mt.operator()<cfg>("100K entries", 100'000);
-        bench_mt.operator()<cfg>("  1M entries", 1'000'000);
-        bench_mt.operator()<cfg>("  2M entries", 2'000'000);
+        WARN(formatThroughput("get -- single key (contention)", THREADS, OPS, best));
     }
 
-    SECTION("2M entries, varying shard count") {
-        bench_mt.operator()<ShardMapConfig{.shard_count_log2 = 2}>("  4 shards", 2'000'000);
-        bench_mt.operator()<ShardMapConfig{.shard_count_log2 = 3}>("  8 shards", 2'000'000);
-        bench_mt.operator()<ShardMapConfig{.shard_count_log2 = 4}>(" 16 shards", 2'000'000);
-        bench_mt.operator()<ShardMapConfig{.shard_count_log2 = 6}>(" 64 shards", 2'000'000);
+    SECTION("get -- distributed keys (parallel)") {
+        Clock::duration best = Clock::duration::max();
+        for (int r = 0; r < RUNS; ++r) {
+            auto elapsed = measureParallel(THREADS, OPS, [&](int tid, int n) {
+                for (int j = 0; j < n; ++j) {
+                    doNotOptimize(map.get(ids[(tid * n + j) % NUM_KEYS]));
+                }
+            });
+            best = std::min(best, elapsed);
+        }
+        WARN(formatThroughput("get -- distributed keys (parallel)", THREADS, OPS, best));
+    }
+
+    SECTION("get(callback) -- distributed keys") {
+        Clock::duration best = Clock::duration::max();
+        for (int r = 0; r < RUNS; ++r) {
+            auto elapsed = measureParallel(THREADS, OPS, [&](int tid, int n) {
+                for (int j = 0; j < n; ++j) {
+                    doNotOptimize(map.get(ids[(tid * n + j) % NUM_KEYS],
+                        [](const auto&, const BenchMetadata& meta) {
+                            doNotOptimize(meta.expiration_rep.load(std::memory_order_relaxed));
+                            return GetAction::Accept;
+                        }));
+                }
+            });
+            best = std::min(best, elapsed);
+        }
+        WARN(formatThroughput("get(callback) -- distributed keys", THREADS, OPS, best));
+    }
+
+    SECTION("mixed read/write -- distributed (75R/25W)") {
+        auto template_val = std::make_shared<int>(999);
+
+        Clock::duration best = Clock::duration::max();
+        for (int r = 0; r < RUNS; ++r) {
+            auto elapsed = measureParallel(THREADS, OPS, [&](int tid, int n) {
+                std::mt19937 trng(tid * 42 + 7);
+                for (int j = 0; j < n; ++j) {
+                    auto kid = ids[(tid * n + j) % NUM_KEYS];
+                    if (trng() % 4 != 0) {
+                        // 75% read
+                        doNotOptimize(map.get(kid));
+                    } else {
+                        // 25% write: invalidate + put
+                        map.invalidate(kid);
+                        map.put(kid, template_val, BenchMetadata{j});
+                    }
+                }
+            });
+            best = std::min(best, elapsed);
+        }
+        WARN(formatThroughput("mixed read/write -- distributed (75R/25W)", THREADS, OPS, best));
+    }
+}
+
+// =============================================================================
+// 7b. Duration-based throughput (sustained measurement)
+// =============================================================================
+
+TEST_CASE("Benchmark: multi-threaded throughput (duration)", "[benchmark][throughput][duration]")
+{
+    static constexpr int THREADS = 6;
+    static constexpr int NUM_KEYS = 64;
+    static constexpr auto cfg = ShardMapConfig{.shard_count_log2 = 3};
+
+    using Map = ShardMap<int64_t, std::shared_ptr<int>, BenchMetadata, cfg>;
+    Map map;
+
+    std::mt19937_64 rng(12345);
+    std::vector<int64_t> ids;
+    ids.reserve(NUM_KEYS);
+    for (int i = 0; i < NUM_KEYS; ++i) {
+        auto key = static_cast<int64_t>(rng());
+        ids.push_back(key);
+        map.put(key, std::make_shared<int>(i), BenchMetadata{i * 1000});
+    }
+
+    SECTION("get -- single key (contention)") {
+        auto key = ids[0];
+        auto result = measureDuration(THREADS, [&](int, std::atomic<bool>& running) -> int64_t {
+            int64_t ops = 0;
+            while (running.load(std::memory_order_relaxed)) {
+                doNotOptimize(map.get(key));
+                ++ops;
+            }
+            return ops;
+        });
+        WARN(formatDurationThroughput("get -- single key (contention) [duration]", THREADS, result));
+    }
+
+    SECTION("get -- distributed keys (parallel)") {
+        auto result = measureDuration(THREADS, [&](int tid, std::atomic<bool>& running) -> int64_t {
+            int64_t ops = 0;
+            while (running.load(std::memory_order_relaxed)) {
+                doNotOptimize(map.get(ids[(tid * 1000000 + ops) % NUM_KEYS]));
+                ++ops;
+            }
+            return ops;
+        });
+        WARN(formatDurationThroughput("get -- distributed keys (parallel) [duration]", THREADS, result));
+    }
+
+    SECTION("get(callback) -- distributed keys") {
+        auto result = measureDuration(THREADS, [&](int tid, std::atomic<bool>& running) -> int64_t {
+            int64_t ops = 0;
+            while (running.load(std::memory_order_relaxed)) {
+                doNotOptimize(map.get(ids[(tid * 1000000 + ops) % NUM_KEYS],
+                    [](const auto&, const BenchMetadata& meta) {
+                        doNotOptimize(meta.expiration_rep.load(std::memory_order_relaxed));
+                        return GetAction::Accept;
+                    }));
+                ++ops;
+            }
+            return ops;
+        });
+        WARN(formatDurationThroughput("get(callback) -- distributed keys [duration]", THREADS, result));
+    }
+
+    SECTION("mixed read/write -- distributed (75R/25W)") {
+        auto template_val = std::make_shared<int>(999);
+
+        auto result = measureDuration(THREADS, [&](int tid, std::atomic<bool>& running) -> int64_t {
+            std::mt19937 trng(tid * 42 + 7);
+            int64_t ops = 0;
+            while (running.load(std::memory_order_relaxed)) {
+                auto kid = ids[(tid * 1000000 + ops) % NUM_KEYS];
+                if (trng() % 4 != 0) {
+                    doNotOptimize(map.get(kid));
+                } else {
+                    map.invalidate(kid);
+                    map.put(kid, template_val, BenchMetadata{static_cast<int64_t>(ops)});
+                }
+                ++ops;
+            }
+            return ops;
+        });
+        WARN(formatDurationThroughput("mixed read/write -- distributed (75R/25W) [duration]", THREADS, result));
     }
 }
 
