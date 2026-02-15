@@ -21,16 +21,10 @@ jobs:
             cc: gcc-14
             cxx: g++-14
             packages: gcc-14 g++-14
-          - compiler: clang-17
-            cc: clang-17
-            cxx: clang++-17
-            packages: clang-17 libc++-17-dev libc++abi-17-dev
-            cmake_flags: -DCMAKE_CXX_FLAGS="-stdlib=libc++"
           - compiler: clang-18
             cc: clang-18
             cxx: clang++-18
-            packages: clang-18 libc++-18-dev libc++abi-18-dev
-            cmake_flags: -DCMAKE_CXX_FLAGS="-stdlib=libc++"
+            packages: clang-18
 
     name: ${{ matrix.compiler }}
 

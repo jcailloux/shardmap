@@ -13,7 +13,7 @@ A thread-safe, header-only in-memory cache for C++23 with sharded storage, custo
 
 ## Requirements
 
-- C++23 compiler (GCC 13+, Clang 17+)
+- C++23 compiler (GCC 13+, Clang 18+)
 - Abseil (Swiss Table `flat_hash_map`, fetched automatically via CMake)
 
 ## Quick Start
