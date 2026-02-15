@@ -1,5 +1,9 @@
 cmake_minimum_required(VERSION 3.20)
-project(shardmap LANGUAGES CXX)
+project(shardmap VERSION 1.0.0 LANGUAGES CXX)
+
+# =============================================================================
+# Library target (header-only)
+# =============================================================================
 
 add_library(shardmap INTERFACE)
 add_library(jcailloux::shardmap ALIAS shardmap)
@@ -15,16 +19,14 @@ target_compile_features(shardmap INTERFACE cxx_std_23)
 # Dependencies
 # =============================================================================
 
-include(FetchContent)
-
-# abseil-cpp — Swiss Table hash map (flat_hash_map)
-FetchContent_Declare(abseil-cpp
-    GIT_REPOSITORY https://github.com/abseil/abseil-cpp.git
-    GIT_TAG        20240722.0
-)
-
-FetchContent_GetProperties(abseil-cpp)
-if(NOT abseil-cpp_POPULATED)
+# Prefer system-installed Abseil (>= 20240116); fall back to FetchContent
+find_package(absl 20240116 QUIET)
+if(NOT absl_FOUND)
+    include(FetchContent)
+    FetchContent_Declare(abseil-cpp
+        GIT_REPOSITORY https://github.com/abseil/abseil-cpp.git
+        GIT_TAG        20260107.1
+    )
     set(ABSL_PROPAGATE_CXX_STD ON)
     set(ABSL_BUILD_TESTING OFF)
     set(ABSL_INSTALL OFF)
@@ -34,53 +36,56 @@ endif()
 target_link_libraries(shardmap INTERFACE absl::flat_hash_map)
 
 # =============================================================================
+# Install (opt-in; requires system-installed Abseil for find_package support)
+# =============================================================================
+
+option(SHARDMAP_INSTALL "Generate install rules" OFF)
+
+if(SHARDMAP_INSTALL)
+    include(GNUInstallDirs)
+    include(CMakePackageConfigHelpers)
+
+    install(TARGETS shardmap EXPORT shardmapTargets)
+
+    install(DIRECTORY include/
+        DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
+    )
+
+    install(EXPORT shardmapTargets
+        FILE shardmapTargets.cmake
+        NAMESPACE jcailloux::
+        DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/shardmap
+    )
+
+    configure_package_config_file(
+        cmake/shardmapConfig.cmake.in
+        ${CMAKE_CURRENT_BINARY_DIR}/shardmapConfig.cmake
+        INSTALL_DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/shardmap
+    )
+
+    write_basic_package_version_file(
+        ${CMAKE_CURRENT_BINARY_DIR}/shardmapConfigVersion.cmake
+        COMPATIBILITY SameMajorVersion
+    )
+
+    install(FILES
+        ${CMAKE_CURRENT_BINARY_DIR}/shardmapConfig.cmake
+        ${CMAKE_CURRENT_BINARY_DIR}/shardmapConfigVersion.cmake
+        DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/shardmap
+    )
+endif()
+
+# =============================================================================
 # Tests
 # =============================================================================
 
-option(SHARDMAP_BUILD_TESTS "Build tests" ON)
+if(PROJECT_IS_TOP_LEVEL)
+    option(SHARDMAP_BUILD_TESTS "Build tests and benchmarks" ON)
+else()
+    option(SHARDMAP_BUILD_TESTS "Build tests and benchmarks" OFF)
+endif()
 
 if(SHARDMAP_BUILD_TESTS)
     enable_testing()
-
-    if(NOT TARGET Catch2::Catch2WithMain)
-        include(FetchContent)
-        FetchContent_Declare(Catch2
-            GIT_REPOSITORY https://github.com/catchorg/Catch2.git
-            GIT_TAG        v3.12.0
-        )
-        FetchContent_MakeAvailable(Catch2)
-    endif()
-
-    # Test executable
-    add_executable(shardmap_tests
-        tests/test_shardmap_basic.cpp
-        tests/test_shardmap_callbacks.cpp
-        tests/test_shardmap_concurrent.cpp
-        tests/test_shardmap_cleanup.cpp
-    )
-
-    target_link_libraries(shardmap_tests
-        PRIVATE
-            jcailloux::shardmap
-            Catch2::Catch2WithMain
-    )
-
-    # Discover tests for CTest
-    list(APPEND CMAKE_MODULE_PATH ${catch2_SOURCE_DIR}/extras)
-    include(CTest)
-    include(Catch)
-    catch_discover_tests(shardmap_tests)
-
-    # Benchmark executable (separate binary, not in CTest)
-    add_executable(shardmap_benchmarks
-        tests/test_shardmap_benchmark.cpp
-    )
-
-    target_link_libraries(shardmap_benchmarks
-        PRIVATE
-            jcailloux::shardmap
-            Catch2::Catch2WithMain
-    )
-
-    target_compile_options(shardmap_benchmarks PRIVATE -O2 -DNDEBUG)
+    add_subdirectory(tests)
 endif()
