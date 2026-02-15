@@ -81,6 +81,8 @@ struct ShardMapConfig {
     constexpr auto operator<=>(const ShardMapConfig&) const = default;
 };
 
+inline constexpr ShardMapConfig DefaultShardMapConfig{};
+
 // =============================================================================
 // SpinRWLock — lightweight reader-writer lock
 // =============================================================================
@@ -147,7 +149,7 @@ template<
     typename K,
     typename V,
     typename Metadata = std::monostate,
-    ShardMapConfig Config = {}
+    ShardMapConfig Config = DefaultShardMapConfig
 >
 class ShardMap {
 public:
