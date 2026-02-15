@@ -16,15 +16,21 @@ jobs:
           - compiler: gcc-13
             cc: gcc-13
             cxx: g++-13
+            packages: gcc-13 g++-13
           - compiler: gcc-14
             cc: gcc-14
             cxx: g++-14
+            packages: gcc-14 g++-14
           - compiler: clang-17
             cc: clang-17
             cxx: clang++-17
+            packages: clang-17 libc++-17-dev libc++abi-17-dev
+            cmake_flags: -DCMAKE_CXX_FLAGS="-stdlib=libc++"
           - compiler: clang-18
             cc: clang-18
             cxx: clang++-18
+            packages: clang-18 libc++-18-dev libc++abi-18-dev
+            cmake_flags: -DCMAKE_CXX_FLAGS="-stdlib=libc++"
 
     name: ${{ matrix.compiler }}
 
@@ -34,13 +40,13 @@ jobs:
       - name: Install compiler
         run: |
           sudo apt-get update
-          sudo apt-get install -y ${{ matrix.cc }} ${{ matrix.cxx }}
+          sudo apt-get install -y ${{ matrix.packages }}
 
       - name: Configure
         env:
           CC: ${{ matrix.cc }}
           CXX: ${{ matrix.cxx }}
-        run: cmake -B build -DCMAKE_BUILD_TYPE=Debug
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Debug ${{ matrix.cmake_flags }}
 
       - name: Build
         run: cmake --build build -j$(nproc)
