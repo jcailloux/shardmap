@@ -47,24 +47,43 @@ flowchart TB
 
 ### Shard Selection
 
-Keys are mapped to shards via high-quality hash functions:
+Keys are mapped to shards via `fast_shard_hash<T>`, a type-dispatched hash function that selects the optimal strategy at compile time:
 
 ```cpp
-static uint8_t shard_id_for(const K& key) {
-    if constexpr (std::is_integral_v<K>) {
-        // Fibonacci hash: multiply + shift (~1ns for integers)
-        return static_cast<uint8_t>(
-            (static_cast<uint64_t>(key) * 11400714819323198485ULL)
-            >> (64 - Config.shard_count_log2)
-        );
+template<typename T>
+static uint64_t fast_shard_hash(const T& val) {
+    if constexpr (std::is_integral_v<T>) {
+        return static_cast<uint64_t>(val) * 11400714819323198485ULL;
+    } else if constexpr (requires { val.data(); val.size(); }
+                         && sizeof(*val.data()) == 1) {
+        // O(1) partial hash — reads at most 8 bytes
+        // ...
+    } else if constexpr (requires { std::tuple_size<std::remove_cvref_t<T>>::value; }) {
+        // Recursive: fast_shard_hash per element
+        // ...
     } else {
-        // Abseil hash for non-integral types (strings, structs)
-        return static_cast<uint8_t>(
-            absl::Hash<K>{}(key) >> (64 - Config.shard_count_log2)
-        );
+        // Fallback: absl::Hash + splitmix64 mixer
+        // ...
     }
 }
+
+static uint8_t shard_id_for(const K& key) {
+    return static_cast<uint8_t>(
+        fast_shard_hash(key) >> (64 - Config.shard_count_log2)
+    );
+}
 ```
+
+The four strategies, in `if constexpr` priority order:
+
+| Type | Strategy | Cost |
+|------|----------|------|
+| Integral (`int`, `int64_t`, ...) | Fibonacci hash (1 multiply + 1 shift) | ~1ns |
+| String-like (`string`, `string_view`, `vector<char>`, ...) | O(1) partial hash inspired by wyhash: reads first 4 + last 4 bytes, mixed with length | ~2-3ns |
+| Tuple-like (`std::pair`, `std::tuple`) | Recursive: applies `fast_shard_hash` to each element, then combines | sum of elements |
+| Other (custom structs, ...) | `absl::Hash<K>` + splitmix64 mixer to decorrelate from Abseil's internal H1/H2 bits | O(n) |
+
+**Why not use `absl::Hash` everywhere?** Since `absl::flat_hash_map` computes `absl::Hash<K>` internally for slot lookup, using the same hash for shard selection would compute it twice. The optimized strategies avoid this redundancy. For types where no specialized strategy exists, the fallback applies a splitmix64 mixer (`h *= 0xbf58476d1ce4e5b9; h ^= h >> 31`) to decorrelate the shard-selection bits from Abseil's internal Swiss table H1/H2 split.
 
 **Fibonacci hashing** uses the golden ratio constant (`2^64 / φ ≈ 11400714819323198485`) to scatter sequential integers across shards. This produces excellent distribution even for consecutive keys like `{1, 2, 3, ...}`, where a simple modulo would cluster entries.
 
