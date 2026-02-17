@@ -5,11 +5,14 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <cstring>
+
 #include <memory>
 #include <mutex>
 #include <new>
 #include <optional>
 #include <shared_mutex>
+#include <tuple>
 #include <type_traits>
 #include <utility>
 #include <vector>
@@ -198,18 +201,61 @@ private:
     // Shard selection
     // =========================================================================
 
-    static uint8_t shard_id_for(const K& key) {
-        if constexpr (std::is_integral_v<K>) {
-            // Fibonacci hash: multiply + shift, ~1ns for integers
-            return static_cast<uint8_t>(
-                (static_cast<uint64_t>(key) * 11400714819323198485ULL)
-                >> (64 - Config.shard_count_log2)
-            );
+    template<typename T>
+    static uint64_t fast_shard_hash(const T& val) {
+        if constexpr (std::is_integral_v<T>) {
+            // Fibonacci hash: 1 multiply, optimal for sequential integers
+            return static_cast<uint64_t>(val) * 11400714819323198485ULL;
+        } else if constexpr (requires {
+                                 val.data();
+                                 val.size();
+                                 requires (sizeof(*val.data()) == 1);
+                             }) {
+            // O(1) partial hash for contiguous byte containers
+            // (string, string_view, vector<char>, ...)
+            const auto* p = reinterpret_cast<const uint8_t*>(val.data());
+            const size_t n = val.size();
+            uint64_t h;
+            if (n >= 4) {
+                uint32_t head, tail;
+                std::memcpy(&head, p, 4);
+                std::memcpy(&tail, p + n - 4, 4);
+                h = (static_cast<uint64_t>(head) << 32 | tail)
+                    ^ (n * 0x9e3779b97f4a7c15ULL);
+            } else if (n > 0) {
+                h = (static_cast<uint64_t>(p[0]) << 16
+                   | static_cast<uint64_t>(p[n >> 1]) << 8
+                   | static_cast<uint64_t>(p[n - 1]))
+                    ^ (n * 0x9e3779b97f4a7c15ULL);
+            } else {
+                h = 0;
+            }
+            h *= 0xbf58476d1ce4e5b9ULL;
+            h ^= h >> 31;
+            return h;
+        } else if constexpr (requires { std::tuple_size<std::remove_cvref_t<T>>::value; }) {
+            // Recursive: optimal hash per tuple/pair element
+            uint64_t h = 0;
+            std::apply([&h](const auto&... args) {
+                ((h = h * 0x9e3779b97f4a7c15ULL + fast_shard_hash(args)), ...);
+            }, val);
+            h *= 0xbf58476d1ce4e5b9ULL;
+            h ^= h >> 31;
+            return h;
         } else {
-            return static_cast<uint8_t>(
-                absl::Hash<K>{}(key) >> (64 - Config.shard_count_log2)
-            );
+            // Fallback: absl::Hash + splitmix64 mixer to decorrelate
+            // from Abseil's internal H1/H2 usage in the Swiss table
+            uint64_t h = static_cast<uint64_t>(absl::Hash<T>{}(val));
+            h *= 0xbf58476d1ce4e5b9ULL;
+            h ^= h >> 31;
+            return h;
         }
+    }
+
+    static uint8_t shard_id_for(const K& key) {
+        return static_cast<uint8_t>(
+            fast_shard_hash(key) >> (64 - Config.shard_count_log2)
+        );
     }
 
     Shard& shard_for(const K& key) {
